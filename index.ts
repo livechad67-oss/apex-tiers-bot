@@ -19,7 +19,7 @@ import {
 import express from "express";
 
 // ============================================================
-// CONFIGURATION
+// CONFIGURATION & WEB SERVER
 // ============================================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -30,6 +30,14 @@ if (!TOKEN) {
   console.error("DISCORD_TOKEN environment variable is required.");
   process.exit(1);
 }
+
+const app = express();
+app.get("/", (_req, res) => {
+  res.send("Apex Tiers Bot is Online!");
+});
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Web server ready.");
+});
 
 // ============================================================
 // IN-MEMORY QUEUE DATABASE
@@ -154,7 +162,6 @@ client.on("interactionCreate", async (interaction: Interaction) => {
 
     const member = interaction.member as GuildMember;
 
-    // Player Actions
     if (action === "join_queue" || action === "leave_queue") {
       if (queue.status === "closed") return interaction.reply({ content: "❌ This queue is closed.", ephemeral: true });
       
@@ -174,7 +181,6 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       return;
     }
 
-    // Tester Protection
     if (!hasTesterRole(member)) {
       return interaction.reply({ content: "❌ Access Denied: Designated testers only.", ephemeral: true });
     }
@@ -247,7 +253,10 @@ async function updatePlayerPanel(guild: any, queue: QueueState) {
 
     if (queue.playerPanelMessageId) {
       const msg = await channel.messages.fetch(queue.playerPanelMessageId).catch(() => null);
-      if (msg) return await msg.edit({ embeds: [closedEmbed], components: [] });
+      if (msg) {
+        await msg.edit({ embeds: [closedEmbed], components: [] });
+        return;
+      }
     }
     const sent = await channel.send({ embeds: [closedEmbed] });
     queue.playerPanelMessageId = sent.id;
@@ -256,12 +265,3 @@ async function updatePlayerPanel(guild: any, queue: QueueState) {
 
   const listText = queue.players.length > 0 
     ? queue.players.map((p, i) => `**#${i + 1}** ┃ <@${p.id}> (${p.displayName})`).join("\n")
-    : "*The queue is currently empty.*";
-
-  const openEmbed = new EmbedBuilder()
-    .setTitle(`⚔️ Apex Tiers: ${queue.name.toUpperCase()}`)
-     
-const app = express();
-app.get("/", (req, res) => res.send("Apex Tiers Bot is Online!"));
-app.listen(process.env.PORT || 3000, () => console.log("Web server ready."));
-   
