@@ -16,6 +16,7 @@ import {
   TextChannel,
   ThreadAutoArchiveDuration,
 } from "discord.js";
+import express from "express";
 
 // ============================================================
 // CONFIGURATION
@@ -259,7 +260,7 @@ async function updatePlayerPanel(guild: any, queue: QueueState) {
 
   const openEmbed = new EmbedBuilder()
     .setTitle(`⚔️ Apex Tiers: ${queue.name.toUpperCase()}`)
-     import express from "express";
+     
 const app = express();
 app.get("/", (req, res) => res.send("Apex Tiers Bot is Online!"));
 app.listen(process.env.PORT || 3000, () => console.log("Web server ready."));
