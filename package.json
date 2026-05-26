@@ -8,6 +8,7 @@
     "start": "npx tsx index.ts"
   },
   "dependencies": {
+    "express": "^4.19.2"
     "discord.js": "^14.14.1"
   },
   "devDependencies": {
