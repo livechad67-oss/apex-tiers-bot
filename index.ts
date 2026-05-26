@@ -1,30 +1,66 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
   ButtonInteraction,
+  ButtonStyle,
+  ChannelType,
   ChatInputCommandInteraction,
   Client,
+  EmbedBuilder,
   GatewayIntentBits,
+  GuildMember,
   Interaction,
   REST,
   Routes,
   SlashCommandBuilder,
+  TextChannel,
+  ThreadAutoArchiveDuration,
 } from "discord.js";
-import {
-  handleCloseQueue,
-  handleJoinQueue,
-  handleLeaveQueue,
-  handleOpenQueue,
-  handlePingQueue,
-  handlePullPlayer,
-} from "./handlers/buttons.js";
-import { handleSetupControl } from "./handlers/commands.js";
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
+const VERIFIED_TESTER_ROLE_NAME = "Verified Tester";
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN environment variable is required.");
   process.exit(1);
 }
+
+// ============================================================
+// IN-MEMORY QUEUE DATABASE
+// ============================================================
+
+interface QueuePlayer {
+  id: string;
+  username: string;
+  displayName: string;
+}
+
+interface QueueState {
+  name: string;
+  status: "open" | "closed";
+  testerId: string;
+  testerName: string;
+  players: QueuePlayer[];
+  controlPanelChannelId: string;
+  controlPanelMessageId: string;
+  playerPanelChannelId: string | null;
+  playerPanelMessageId: string | null;
+}
+
+const queues = new Map<string, QueueState>();
+
+function hasTesterRole(member: GuildMember): boolean {
+  return member.roles.cache.some((role) => role.name === VERIFIED_TESTER_ROLE_NAME) || member.permissions.has("Administrator");
+}
+
+// ============================================================
+// COMMANDS & REGISTRATION
+// ============================================================
 
 const commands = [
   new SlashCommandBuilder()
@@ -42,7 +78,6 @@ const commands = [
         .setDescription("Channel where the player interface will be posted (defaults to this one)")
         .setRequired(false)
     )
-    .setDefaultMemberPermissions(null)
     .toJSON(),
 ];
 
@@ -56,93 +91,172 @@ const client = new Client({
 
 client.once("ready", async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
-
   const rest = new REST().setToken(TOKEN!);
-
   try {
     if (GUILD_ID) {
-      console.log(`Registering slash commands to guild ${GUILD_ID}...`);
-      await rest.put(
-        Routes.applicationGuildCommands(readyClient.user.id, GUILD_ID),
-        { body: commands }
-      );
-      console.log("Guild commands registered.");
+      await rest.put(Routes.applicationGuildCommands(readyClient.user.id, GUILD_ID), { body: commands });
     } else {
-      console.log("Registering global slash commands (may take up to 1 hour to appear)...");
-      await rest.put(Routes.applicationCommands(readyClient.user.id), {
-        body: commands,
-      });
-      console.log("Global commands registered.");
+      await rest.put(Routes.applicationCommands(readyClient.user.id), { body: commands });
     }
+    console.log("Commands registered successfully.");
   } catch (err) {
     console.error("Failed to register commands:", err);
   }
 });
 
+// ============================================================
+// HANDLERS
+// ============================================================
+
 client.on("interactionCreate", async (interaction: Interaction) => {
-  if (interaction.isChatInputCommand()) {
-    await handleChatCommand(interaction);
-  } else if (interaction.isButton()) {
-    await handleButton(interaction);
+  if (interaction.isChatInputCommand() && interaction.commandName === "setupcontrol") {
+    const member = interaction.member as GuildMember;
+    if (!hasTesterRole(member)) {
+      return interaction.reply({ content: `❌ You must have the "${VERIFIED_TESTER_ROLE_NAME}" role to use this.`, ephemeral: true });
+    }
+
+    const name = interaction.options.getString("name", true).toLowerCase();
+    const targetChannel = (interaction.options.getChannel("channel") || interaction.channel) as TextChannel;
+
+    const controlEmbed = new EmbedBuilder()
+      .setTitle(`🎛️ Control Panel: ${name.toUpperCase()}`)
+      .setDescription(`**Current Status:** Closed 🔴\n**Active Tester:** None`)
+      .setColor("#f04747");
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`open_queue::${name}`).setLabel("Open Queue").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`close_queue::${name}`).setLabel("Close Queue").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`pull_player::${name}`).setLabel("Pull Player").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`ping_queue::${name}`).setLabel("Ping Queue").setStyle(ButtonStyle.Secondary)
+    );
+
+    const msg = await interaction.reply({ embeds: [controlEmbed], components: [row], fetchReply: true });
+
+    queues.set(name, {
+      name,
+      status: "closed",
+      testerId: "",
+      testerName: "",
+      players: [],
+      controlPanelChannelId: interaction.channelId,
+      controlPanelMessageId: msg.id,
+      playerPanelChannelId: targetChannel.id,
+      playerPanelMessageId: null,
+    });
+    return;
+  }
+
+  if (interaction.isButton()) {
+    const [action, name] = interaction.customId.split("::");
+    const queue = queues.get(name);
+    if (!queue) return interaction.reply({ content: "❌ Queue profile layout data not found.", ephemeral: true });
+
+    const member = interaction.member as GuildMember;
+
+    // Player Actions
+    if (action === "join_queue" || action === "leave_queue") {
+      if (queue.status === "closed") return interaction.reply({ content: "❌ This queue is closed.", ephemeral: true });
+      
+      if (action === "join_queue") {
+        if (queue.players.some((p) => p.id === interaction.user.id)) {
+          return interaction.reply({ content: "❌ You are already in this queue.", ephemeral: true });
+        }
+        queue.players.push({ id: interaction.user.id, username: interaction.user.username, displayName: member.displayName });
+        await interaction.reply({ content: "✅ Joined the queue!", ephemeral: true });
+      } else {
+        const idx = queue.players.findIndex((p) => p.id === interaction.user.id);
+        if (idx === -1) return interaction.reply({ content: "❌ You are not in this queue.", ephemeral: true });
+        queue.players.splice(idx, 1);
+        await interaction.reply({ content: "🛑 Left the queue.", ephemeral: true });
+      }
+      await updatePlayerPanel(interaction.guild!, queue);
+      return;
+    }
+
+    // Tester Protection
+    if (!hasTesterRole(member)) {
+      return interaction.reply({ content: "❌ Access Denied: Designated testers only.", ephemeral: true });
+    }
+
+    if (action === "open_queue") {
+      queue.status = "open";
+      queue.testerId = interaction.user.id;
+      queue.testerName = member.displayName;
+      await interaction.reply({ content: "🟢 Queue opened!", ephemeral: true });
+      await updateControlPanel(interaction, queue);
+      await updatePlayerPanel(interaction.guild!, queue);
+    } 
+    
+    else if (action === "close_queue") {
+      queue.status = "closed";
+      queue.players = [];
+      await interaction.reply({ content: "🔴 Queue closed.", ephemeral: true });
+      await updateControlPanel(interaction, queue);
+      await updatePlayerPanel(interaction.guild!, queue);
+    } 
+    
+    else if (action === "pull_player") {
+      if (queue.players.length === 0) return interaction.reply({ content: "❌ The queue is empty.", ephemeral: true });
+      
+      const target = queue.players.shift()!;
+      await interaction.reply({ content: `🔄 Pulling <@${target.id}>...`, ephemeral: true });
+
+      const channel = interaction.channel as TextChannel;
+      const thread = await channel.threads.create({
+        name: `⚔️┃test-${target.username}`,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
+        type: ChannelType.PrivateThread,
+      });
+
+      await thread.members.add(interaction.user.id);
+      await thread.members.add(target.id);
+      await thread.send({ content: `⚔️ **Apex Tiers Arena Ready!**\nTester: <@${interaction.user.id}>\nCandidate: <@${target.id}>` });
+
+      await updatePlayerPanel(interaction.guild!, queue);
+    } 
+    
+    else if (action === "ping_queue") {
+      if (queue.players.length === 0) return interaction.reply({ content: "❌ Nobody is in the queue.", ephemeral: true });
+      const pings = queue.players.map((p) => `<@${p.id}>`).join(" ");
+      const channel = interaction.channel as TextChannel;
+      await channel.send({ content: `⚠️ **Apex Tiers Alert:** ${pings} - Your tester is ready!` });
+      await interaction.reply({ content: "✅ Pings broadcasted.", ephemeral: true });
+    }
   }
 });
 
-async function handleChatCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  try {
-    if (interaction.commandName === "setupcontrol") {
-      await handleSetupControl(interaction);
-    }
-  } catch (err) {
-    console.error("Error handling command:", err);
-    const msg = { content: "An error occurred while processing that command.", ephemeral: true };
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(msg).catch(console.error);
-    } else {
-      await interaction.reply(msg).catch(console.error);
-    }
-  }
+async function updateControlPanel(interaction: ButtonInteraction, queue: QueueState) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🎛️ Control Panel: ${queue.name.toUpperCase()}`)
+    .setDescription(`**Current Status:** ${queue.status === "open" ? "Open 🟢" : "Closed 🔴"}\n**Active Tester:** ${queue.status === "open" ? queue.testerName : "None"}`)
+    .setColor(queue.status === "open" ? "#43b581" : "#f04747");
+  await interaction.message.edit({ embeds: [embed] });
 }
 
-async function handleButton(interaction: ButtonInteraction): Promise<void> {
-  const [action, encodedName] = interaction.customId.split("::");
+async function updatePlayerPanel(guild: any, queue: QueueState) {
+  if (!queue.playerPanelChannelId) return;
+  const channel = await guild.channels.fetch(queue.playerPanelChannelId).catch(() => null) as TextChannel;
+  if (!channel) return;
 
-  if (!action || !encodedName) return;
+  if (queue.status === "closed") {
+    const closedEmbed = new EmbedBuilder()
+      .setTitle(`🔴 ${queue.name.toUpperCase()} Locked`)
+      .setDescription(`⚠️ **No testers are online right now.**\nPlease wait until a Verified Tester opens the match queue.`)
+      .setColor("#f04747");
 
-  try {
-    switch (action) {
-      case "open_queue":
-        await handleOpenQueue(interaction, encodedName);
-        break;
-      case "close_queue":
-        await handleCloseQueue(interaction, encodedName);
-        break;
-      case "pull_player":
-        await handlePullPlayer(interaction, encodedName);
-        break;
-      case "ping_queue":
-        await handlePingQueue(interaction, encodedName);
-        break;
-      case "join_queue":
-        await handleJoinQueue(interaction, encodedName);
-        break;
-      case "leave_queue":
-        await handleLeaveQueue(interaction, encodedName);
-        break;
-      default:
-        break;
+    if (queue.playerPanelMessageId) {
+      const msg = await channel.messages.fetch(queue.playerPanelMessageId).catch(() => null);
+      if (msg) return await msg.edit({ embeds: [closedEmbed], components: [] });
     }
-  } catch (err) {
-    console.error(`Error handling button [${interaction.customId}]:`, err);
-    const msg = { content: "An error occurred while handling that button.", ephemeral: true };
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(msg).catch(console.error);
-    } else {
-      await interaction.reply(msg).catch(console.error);
-    }
+    const sent = await channel.send({ embeds: [closedEmbed] });
+    queue.playerPanelMessageId = sent.id;
+    return;
   }
-}
 
-client.login(TOKEN).catch((err) => {
-  console.error("Failed to log in:", err);
-  process.exit(1);
-});
+  const listText = queue.players.length > 0 
+    ? queue.players.map((p, i) => `**#${i + 1}** ┃ <@${p.id}> (${p.displayName})`).join("\n")
+    : "*The queue is currently empty.*";
+
+  const openEmbed = new EmbedBuilder()
+    .setTitle(`⚔️ Apex Tiers: ${queue.name.toUpperCase()}`)
+        
